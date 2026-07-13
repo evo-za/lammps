@@ -70,13 +70,37 @@ static inline int FLIPSIDE(int nside)
 /* ---------------------------------------------------------------------- */
 
 PairSurfGranular::PairSurfGranular(LAMMPS *lmp) :
-    PairGranular(lmp), endpts(nullptr), corners(nullptr), avecline(nullptr), avectri(nullptr),
-    fsl(nullptr), connect2d(nullptr), connect3d(nullptr), tcp(nullptr), atom2connect(nullptr)
+    PairGranular(lmp), wear_flag(false), k_finnie(0.0), wear_index(-1), endpts(nullptr),
+    corners(nullptr), avecline(nullptr), avectri(nullptr), fsl(nullptr), connect2d(nullptr),
+    connect3d(nullptr), tcp(nullptr), atom2connect(nullptr)
 {
   single_enable = 0;
 
   emax = 0;
   cmax = 0;
+}
+
+/* ----------------------------------------------------------------------
+   proof-of-concept addition: an optional trailing "wear finnie <k>"
+   keyword, consumed here and stripped before delegating to
+   PairGranular::settings() for everything else.
+------------------------------------------------------------------------- */
+
+void PairSurfGranular::settings(int narg, char **arg)
+{
+  int base_narg = narg;
+  if (narg >= 3 && strcmp(arg[narg - 3], "wear") == 0 && strcmp(arg[narg - 2], "finnie") == 0) {
+    wear_flag = true;
+    k_finnie = utils::numeric(FLERR, arg[narg - 1], false, lmp);
+    base_narg = narg - 3;
+
+    // register here, not init_style(): dump validates its field list
+    // before pair init_style() runs
+    int wcols, wflag;
+    wear_index = atom->find_custom("wear", wflag, wcols);
+    if (wear_index < 0) wear_index = atom->add_custom("wear", 1, 0, 1);
+  }
+  PairGranular::settings(base_narg, arg);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -448,6 +472,57 @@ void PairSurfGranular::compute(int eflag, int vflag)
       }
 
       model->calculate_forces();
+
+      // Proof-of-concept Finnie wear accumulation (not upstream LAMMPS).
+      // Ports the impact-angle erosion model from LIGGGHTS'
+      // mesh_module_stress.cpp: for grazing impacts (cos_gamma small, or
+      // 3*sin_gamma > cos_gamma) E = (1/3)cos^2(gamma), otherwise
+      // E = sin(2 gamma) - 3 sin^2(gamma); wear rate scales with
+      // k_finnie * relative velocity * contact force, normalized by
+      // triangle area. Accumulated onto the tri atom's custom per-atom
+      // "wear" property (dumpable via d_wear).
+      if (wear_flag && style == TRI) {
+        double vrel[3];
+        vrel[0] = model->vi[0] - model->vj[0];
+        vrel[1] = model->vi[1] - model->vj[1];
+        vrel[2] = model->vi[2] - model->vj[2];
+        double vrel_mag = MathExtra::len3(vrel);
+
+        if (vrel_mag > 1.0e-12) {
+          double surfnorm[3];
+          MathExtra::copy3(contact_surfs[n].surf_norm, surfnorm);
+
+          double sin_gamma = fabs(MathExtra::dot3(vrel, surfnorm)) / vrel_mag;
+          double vcross[3];
+          MathExtra::cross3(vrel, surfnorm, vcross);
+          double cos_gamma = MathExtra::len3(vcross) / vrel_mag;
+          if (cos_gamma > 1.0) cos_gamma = 1.0;
+          if (sin_gamma > 1.0) sin_gamma = 1.0;
+
+          double E;
+          if (cos_gamma < EPSILON || 3.0 * sin_gamma > cos_gamma) {
+            E = 0.333333 * cos_gamma * cos_gamma;
+          } else {
+            double sin_2gamma = 2.0 * sin_gamma * cos_gamma;
+            E = sin_2gamma - 3.0 * sin_gamma * sin_gamma;
+          }
+
+          double fmag = MathExtra::len3(model->forces);
+          E *= 2.0 * k_finnie * vrel_mag * fmag;
+
+          double *corner = corners[tri[j]];
+          double e1[3], e2[3], tri_normal_x_area[3];
+          MathExtra::sub3(&corner[3], &corner[0], e1);
+          MathExtra::sub3(&corner[6], &corner[0], e2);
+          MathExtra::cross3(e1, e2, tri_normal_x_area);
+          double tri_area = 0.5 * MathExtra::len3(tri_normal_x_area);
+
+          if (tri_area > EPSILON) {
+            double wear_increment = E * update->dt / tri_area;
+            atom->dvector[wear_index][j] += wear_increment;
+          }
+        }
+      }
 
       // Sychronize history across flat contacts
       //   can be arbitrary if not all connected flat surfaces are mutually flat

@@ -36,10 +36,21 @@ class PairSurfGranular : public PairGranular {
   PairSurfGranular(class LAMMPS *);
   ~PairSurfGranular() override;
   void compute(int, int) override;
+  void settings(int, char **) override;
   void init_style() override;
   double memory_usage() override;
 
  protected:
+  // Finnie wear tracking (proof-of-concept addition, not upstream LAMMPS):
+  // optional "wear finnie <k>" trailing keyword on pair_style surf/granular.
+  // Accumulates a wear-rate scalar per contact onto each tri atom's custom
+  // per-atom double property "wear" (dumpable via dump ... d_wear),
+  // following the same impact-angle erosion model LIGGGHTS uses in
+  // mesh_module_stress.cpp.
+  bool wear_flag;
+  double k_finnie;
+  int wear_index;
+
   int surfmoveflag;
 
   int style;
